@@ -1,0 +1,379 @@
+In this text file I will attempt to list all the modifications (that I can
+remember) that are necessary to include the QWK supported functions within
+Asgard/Citadel.  The majority of the routines are contained in ASGQWK.C,
+however, there are a few supporting routines that may/will have to be modified.
+I have tried to include the complete routine when I felt it was necessary,
+and just the additional lines on other ones.  If there are any questions, I
+can be reached through Hotel @ (916) 927-7680 300/14400, or in the C-86 Network
+in C-86 source, Citanews or Sysop related rooms.
+                                        Gary Meadows
+
+ ---  This is the upload routine as I have modified for Asgard.  Key points that
+      changed in this routine is the passed filename and needtomove variable.
+      Also need to make sure that this routine sets a variable upon completion
+      of upload for success or failure.  This routine was extracted from MISC.C
+      for inclusion in this file.
+
+/*
+ * upLoad()
+ *
+ * This enters a file into current directory.
+ */
+void upLoad(int WC, char *file, char NeedToMove)
+{
+    char fileName[MAX_FILENAME - 1];
+    char curdir[100];
+    char successful;
+    long size;
+
+    getcwd(curdir, 100);
+    if (file[0])
+        strcpy(fileName, file);
+    else
+        getNormStr(strFile, fileName, sizeof fileName, 0);
+    if (!fileName[0]) return;
+
+        /* Can't tolerate bad file names */
+    if (!ValidDirFileName(fileName)) {
+        mPrintf("Illegal file name.\n ");
+        return ;
+    }
+
+    if (NeedToMove) {
+        if (!aide && roomBuf.rbflags.REDIRECT_UPLOADS
+            && cfg.newupArea.naDirname[0]) {
+            if (!netSetNewArea(&cfg.newupArea))
+                return;
+        }
+        else
+            if (!setSpace(&roomBuf)) {          /* System error -- yucky. */
+                return ;
+        }
+    }
+
+    if (LowFree != 0 && RoomLeft(&roomBuf) < LowFree) {
+        mPrintf("Sorry, not enough room left on disk.\n ");
+        if (NeedToMove)
+            homeSpace();
+        return ;
+    }
+
+    if (access(fileName, 0) != -1) {
+                                    /* File already exists */
+        mPrintf("\n File: %s already exists.\n ", fileName);
+        if (NeedToMove)
+            homeSpace();
+        return;
+    } else {                    /* Go for it */
+        if (!expert && InternalProtocol(WC)) {
+            homeSpace();
+            tutorial(FALSE, Table[WC].UpBlbName, TRUE, FALSE);
+            if (!NeedToMove)
+                chdir(curdir);
+            else {
+                if (!aide && roomBuf.rbflags.REDIRECT_UPLOADS
+                    && cfg.newupArea.naDirname[0]) {
+                    netSetNewArea(&cfg.newupArea);
+                }
+                else
+                    setSpace(&roomBuf);
+            }
+        }
+
+        if (!getYesNo("Ready for transfer")) {
+            if (NeedToMove)
+                homeSpace();
+            return;
+        }
+
+        if (!InternalProtocol(WC)) {
+            fileMessage(FL_START, fileName, FALSE, WC, 0l);
+            successful = (ExternalProtocol(WC, TRUE, fileName, NULL, NeedToMove)
+                                                == TRAN_SUCCESS);
+            if (successful) {       /* so we can get the file size */
+                upfd = safeopen(fileName, READ_ANY);
+            }
+        }
+        else {
+            if ((upfd = safeopen(fileName, WRITE_ANY)) == NULL) {
+                mPrintf("\n Can't create %s!\n", fileName);
+                if (NeedToMove)
+                    homeSpace();
+                return;
+            }
+#ifdef HORRID_AMIGA_LATTICE_BUG
+            setnbf(upfd);
+#endif
+            fileMessage(FL_START, fileName, FALSE, WC, 0l);
+            successful = (Reception(WC, putFLChar) == TRAN_SUCCESS);
+        }
+
+        if (successful) totalBytes(&size, upfd);
+        fclose(upfd);
+
+        if (!successful) unlink(fileName);
+        else if ((successful = FileIntegrity(fileName))==0) {
+            unlink(fileName);
+        }
+
+        if (NeedToMove)
+            homeSpace();
+
+        fileMessage(successful ? FL_SUCCESS : FL_FAIL, fileName,
+                                        FALSE, WC, size);
+        if (successful && fileName[0] != '*' && NeedToMove)  {
+            if (loggedIn)
+                upldcnt++;
+            FileCommentUpdate(fileName, TRUE);
+        }
+    }
+}
+
+ ---  This is the TransSend routine as I have modified for Asgard.  Key points
+      changed in this routine is the checking and passing of the status of the
+      transfer of the file, success or failure. This routine was extracted from
+      MISC.C for inclusion in this file.  The status is passed in a global
+      variable called FileTransStat.
+
+/*
+ * TranSend()
+ *
+ * This does the send work of TranFiles().
+ */
+void TranSend(int protocol, void (*fn)(DirEntry *f), char *FileSpec,
+                                                 char *phrase, char NeedToMove)
+{
+    char success;
+    DirEntry temp = { "", "", 0l };
+
+    startTimer(WORK_TIMER);
+
+    if (InternalProtocol(protocol)) {
+        TransProtocol = protocol;
+
+        wildCard((FormatFlag) ? doFormatted : fn, FileSpec, NeedToMove,
+                                        phrase, TRUE);
+
+        if (Table[protocol].flags & NEEDS_FIN)
+            (*fn)(&temp);
+    }
+    else {
+        success = ExternalProtocol(protocol, FALSE, FileSpec, phrase, NeedToMove);
+        if (success == TRAN_SUCCESS)
+            FileTransStat = FL_SUCCESS;
+        else
+            FileTransStat = FL_FAIL;
+    }
+
+    if (!InternalProtocol(protocol) || (Table[protocol].flags & IS_DL))
+        *DL_Total += chkTimeSince(WORK_TIMER);
+
+    TransProtocol = ASCII;
+    if (!InternalProtocol(protocol) || (Table[protocol].flags & RIGAMAROLE))
+        oChar(BELL);
+}
+
+--- In CALLLOG.C I delcare this variable:
+
+char FileTransStat;
+
+--- for use in checking the status of file transfers, both upload and download.
+    I then modified the fileMessage() function to set the FileTransStat according
+    to the mode variable that is passed to it.
+
+#ifndef NO_FILE_RECORDING
+/*
+ * fileMessage()
+ *
+ * This function handles the upload/download file log.
+ */
+void fileMessage(char mode, char *fn, char IsDL, int protocol, long size)
+{
+    long          work, hours, mins;
+    static label  LastActive = "";
+    char          logfn[100];
+    int           yr, dy, hr, mn;
+    char          *mon, *pr, buf[100];
+    static struct timeData fData;
+
+    if (protocol == ASCII || cfg.Audit == 0)
+        return;
+
+    makeAuditName(logfn, "filelog.sys");
+    getCdate(&yr, &mon, &dy, &hr, &mn);
+
+    switch (mode) {
+    case FL_START:
+        startTimer(USER_TIMER);
+        fData.y = yr;
+        fData.d = dy;
+        fData.h = hr;
+        fData.m = mn;
+        strcpy(fData.month, mon);
+        break;
+    case FL_SUCCESS:
+    case FL_FAIL:
+        FileTransStat = mode;
+    case FL_EX_END:
+        if (strCmpU(LastActive, logBuf.lbname) != SAMESTRING) {
+            sPrintf(buf, "\n%s on %d%s%02d @ %d:", logBuf.lbname, yr, mon, dy,
+                                                        byteRate * 10);
+            CallMsg(logfn, buf);
+            strCpy(LastActive, logBuf.lbname);
+        }
+        work = chkTimeSince(USER_TIMER);
+        hours = work / 3600;
+        work -= (hours * 3600);
+        mins  = work / 60;
+        work -= (mins * 60);
+        if (protocol > TOP_PROTOCOL)
+            pr = FindProtoName(protocol);
+        else
+            pr = Table[protocol].GenericName;
+        if (mode == FL_EX_END) {
+            sPrintf(buf,
+    "%2cFollowing files %c %s via %s %d:%02d - %d:%02d (%ld:%02ld:%02ld):",
+           ' ', (IsDL) ? 'D' : 'U', roomBuf.rbname,
+                pr,
+                fData.h, fData.m, hr, mn,
+                hours, mins, work);
+            CallMsg(logfn, buf);
+            CallMsg(logfn, msgBuf->mbtext);
+        }
+        else {
+            sPrintf(buf,
+    "%2c%s (%ld) %s %s: %d:%02d - %d:%02d (%ld:%02ld:%02ld) %s. %s",
+                ' ', fn, size, (IsDL) ? "D" : "U", roomBuf.rbname,
+                fData.h, fData.m, hr, mn,
+                hours, mins, work,
+                pr,
+                (mode == FL_FAIL) ? "(FAILED)" : "");
+            CallMsg(logfn, buf);
+        }
+        break;
+    }
+}
+#else
+void fileMessage(char mode, char *fn, char IsDL, int protocol, long size)
+{
+    if (mode == FL_SUCCESS || mode == FL_FAIL)
+        FileTransStat = mode;
+}
+#endif
+
+---  In the doRegular function in CTDL.C, a call needs to be added for the
+     QWK Mail reader call.
+     add:
+             TERM "QWK Mail"
+     in the *RegOpts[] definition, and:
+
+             case 'Q': toReturn = QWKmain();                 break;
+
+     to the switch(cc[0]) statement.
+
+--- There were also changes made to the SYSZM.C routines to accomodate
+    the NeedToMove variables and the transfer status checks.
+
+/*
+ * ExternalProtocol()
+ *
+ * This function handles external protocols.
+ */
+int ExternalProtocol(int protocol, char upload, char *mask, char *phrase,
+                                                            char Move)
+{
+    PROTOCOL *Prot;
+    char     cmdline[125];      /* we have a limit */
+    int      toReturn, realCount;
+
+    if ((Prot = SearchList(&ExtProtocols, &protocol)) == NULL)
+        return TRAN_FAILURE;
+
+    if (Move) {
+        if (upload && !aide && roomBuf.rbflags.REDIRECT_UPLOADS &&
+            cfg.newupArea.naDirname[0] && upload) {
+            if (!netSetNewArea(&cfg.newupArea)) {
+                mPrintf("SetSpace failure, aborting!\n ");
+                return TRAN_FAILURE;
+            }
+        }
+        else {
+            if (!setSpace(&roomBuf)) {
+                mPrintf("SetSpace failure, aborting!\n ");
+                return TRAN_FAILURE;
+            }
+        }
+    }
+
+    if (!upload) {
+        msgBuf->mbtext[0] = 0;
+        wildCard(AddName, mask, FALSE, phrase, TRUE);
+    }
+    else strCpy(msgBuf->mbtext, mask);
+
+    if (!MakeCmdLine(cmdline,Prot->CmdLine,msgBuf->mbtext,sizeof cmdline - 1)) {
+        if (strchr(mask, '>') != NULL || strchr(mask, '<') != NULL) {
+            mPrintf("Sorry, the list of files would be too long.  Try again without a date specification.\n ");
+            if (Move) homeSpace();
+            return TRAN_FAILURE;
+        }
+        else
+        if (!MakeCmdLine(cmdline,Prot->CmdLine,mask,sizeof cmdline - 1)) {
+            mPrintf("Sorry, the list of files would be too long.\n ");
+            if (Move) homeSpace();
+            return TRAN_FAILURE;
+        }
+    }
+
+    if (!upload)
+        fileMessage(FL_START, mask, TRUE, protocol, 0l);
+
+    if (loggedIn) printf("\n(%s)\n", logBuf.lbname);
+    CitSystem(TRUE, "%s", cmdline);
+    if (!upload) {
+        GetSizes = TRUE;
+        ExCount = 0;
+        strCpy(msgBuf->mbtext, "   ");
+        realCount=wildCard(AddName, mask, Move, phrase, TRUE);
+        GetSizes = FALSE;
+        if (Move) homeSpace();
+        fileMessage(FL_EX_END, mask, TRUE, protocol, 0l /* filled in */);
+        toReturn = TRAN_SUCCESS;
+        if (realCount > 0);
+            transRecDown(mask, realCount);
+    }
+    else toReturn = (access(mask, 0) == 0) ? TRAN_SUCCESS : TRAN_FAILURE;
+
+    return toReturn;
+}
+
+--- There are some new variables that have to be added to CONFG.C
+    otherSpecs routine:
+
+        } else if (strCmp(var, "#QWKMAXPACKET") == SAMESTRING) {
+            cfg.QWKMAXPACKET = arg;
+        } else if (strCmp(var, "#QWKMAXROOM") == SAMESTRING) {
+            cfg.QWKMAXROOM = arg;
+
+--- And there are some new ones for SYSCFG.C as well, sysSpecs2 routine:
+
+        } else if (strCmp(var, "#QWKFILESAREA" )    == SAMESTRING) {
+            offset = doAreaCommon(var, line, &cfg.QWKFilesArea, offset, QWKFILE, FALSE);
+        } else if (strCmp(var, "#QWKWORKAREA" )    == SAMESTRING) {
+            offset = doAreaCommon(var, line, &cfg.QWKWorkArea, offset, QWKWORK, FALSE);
+
+--- And in the SysDepIntegrity routine of SYSCFG.C:
+
+    if (necessary[QWKFILE])
+        dirExists(cfg.QWKFilesArea.saDisk, makeN(cfg.QWKFilesArea.saDirname));
+
+    if (necessary[QWKWORK])
+        dirExists(cfg.QWKWorkArea.saDisk, makeN(cfg.QWKWorkArea.saDirname));
+
+--- The last item that needs to be done is the variables in the message
+    structure and the new variables in the cfg structure.
+    I've included my ASG.H header file and my LIBMSG.C file for reference.
+    Just in case.  All the remaining QWK support is contained in the ASGQWK.C
+    source module.
+
+
